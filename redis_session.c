@@ -559,8 +559,6 @@ static char *cluster_open_session_key(redisCluster *c, const char *key, int keyl
     memcpy(skey, prefix, prefix_len);
     memcpy(skey + prefix_len, key, keylen);
 
-    // TODO: append process and thread id to this
-    
     *slot = cluster_hash_key(skey, *skeylen);
 
     return skey;
