@@ -42,6 +42,8 @@
 #include "SAPI.h"
 #include "ext/standard/url.h"
 
+#define LOCK_TIMEOUT_SECONDS 60
+
 ps_module ps_mod_redis = {
     PS_MOD(redis)
 };
@@ -73,6 +75,13 @@ typedef struct {
     redis_pool_member *head;
 
 } redis_pool;
+
+typedef struct {
+    char *session_key;
+
+    redis_pool *pool;
+    redisCluster *c;
+} redis_ps_mod_data;
 
 PHP_REDIS_API redis_pool*
 redis_pool_new(TSRMLS_D) {
@@ -293,7 +302,11 @@ PS_OPEN_FUNC(redis)
     }
 
     if (pool->head) {
-        PS_SET_MOD_DATA(pool);
+        redis_ps_mod_data *data = (redis_ps_mod_data*)emalloc(sizeof(redis_ps_mod_data));
+        data->session_key = NULL;
+        data->pool = pool;
+        PS_SET_MOD_DATA(data);
+
         return SUCCESS;
     }
 
@@ -305,9 +318,20 @@ PS_OPEN_FUNC(redis)
  */
 PS_CLOSE_FUNC(redis)
 {
-    redis_pool *pool = PS_GET_MOD_DATA();
+    redis_ps_mod_data *data = PS_GET_MOD_DATA();
+    redis_pool *pool = data->pool;
 
     if(pool){
+        if (data->session_key != NULL) {
+            redis_pool_member *rpm = redis_pool_get_sock(pool, data->session_key TSRMLS_CC);
+            RedisSock *redis_sock = rpm ? rpm->redis_sock : NULL;
+            if (!rpm || !redis_sock){
+                return FAILURE;
+            }
+
+            release_open_session_lock(NULL, redis_sock, data->session_key);
+        }
+
         redis_pool_free(pool TSRMLS_CC);
         PS_SET_MOD_DATA(NULL);
     }
@@ -344,11 +368,19 @@ PS_READ_FUNC(redis)
     char *session, *cmd;
     int session_len, cmd_len;
 
-    redis_pool *pool = PS_GET_MOD_DATA();
+    redis_ps_mod_data *data = PS_GET_MOD_DATA();
+    redis_pool *pool = data->pool;
+
     redis_pool_member *rpm = redis_pool_get_sock(pool, key TSRMLS_CC);
     RedisSock *redis_sock = rpm?rpm->redis_sock:NULL;
     if(!rpm || !redis_sock){
         return FAILURE;
+    }
+
+    if (data->session_key == NULL) {
+        if (acquire_open_session_lock(NULL, redis_sock, data->session_key) == FAILURE) {
+            return FAILURE;
+        }
     }
 
     /* send GET command */
@@ -378,7 +410,8 @@ PS_WRITE_FUNC(redis)
     char *cmd, *response, *session;
     int cmd_len, response_len, session_len;
 
-    redis_pool *pool = PS_GET_MOD_DATA();
+    redis_ps_mod_data *data = PS_GET_MOD_DATA();
+    redis_pool *pool = data->pool;
     redis_pool_member *rpm = redis_pool_get_sock(pool, key TSRMLS_CC);
     RedisSock *redis_sock = rpm?rpm->redis_sock:NULL;
     if(!rpm || !redis_sock){
@@ -420,7 +453,8 @@ PS_DESTROY_FUNC(redis)
     char *cmd, *response, *session;
     int cmd_len, response_len, session_len;
 
-    redis_pool *pool = PS_GET_MOD_DATA();
+    redis_ps_mod_data *data = PS_GET_MOD_DATA();
+    redis_pool *pool = data->pool;
     redis_pool_member *rpm = redis_pool_get_sock(pool, key TSRMLS_CC);
     RedisSock *redis_sock = rpm?rpm->redis_sock:NULL;
     if(!rpm || !redis_sock){
@@ -515,6 +549,23 @@ static char *cluster_session_key(redisCluster *c, const char *key, int keylen,
     return skey;
 }
 
+static char *cluster_open_session_key(redisCluster *c, const char *key, int keylen, 
+                                      int *skeylen, short *slot) {
+    char *skey, *prefix = "open_sessions";
+    size_t prefix_len = strlen(prefix);
+
+    *skeylen = keylen + prefix_len;
+    skey = emalloc(*skeylen);
+    memcpy(skey, prefix, prefix_len);
+    memcpy(skey + prefix_len, key, keylen);
+
+    // TODO: append process and thread id to this
+    
+    *slot = cluster_hash_key(skey, *skeylen);
+
+    return skey;
+}
+
 PS_OPEN_FUNC(rediscluster) {
     redisCluster *c;
     zval *z_conf, **z_val;
@@ -587,7 +638,11 @@ PS_OPEN_FUNC(rediscluster) {
         c->flags->prefix = estrndup(prefix, prefix_len);
         c->flags->prefix_len = prefix_len;
 
-        PS_SET_MOD_DATA(c);
+        redis_ps_mod_data *data = (redis_ps_mod_data*)emalloc(sizeof(redis_ps_mod_data));
+        data->session_key = NULL;
+        data->c = c;
+        PS_SET_MOD_DATA(data);
+
         retval = SUCCESS;
     } else {
         cluster_free(c);
@@ -601,14 +656,147 @@ PS_OPEN_FUNC(rediscluster) {
     return retval;
 }
 
+int acquire_open_session_lock(redisCluster *c, RedisSock *sck, char *key) {
+    clusterReply *c_reply;
+    int sck_reply_len;
+    char *sck_reply;
+
+    char *cmd;
+    int cmdlen, skeylen;
+    short slot;
+    int retcode = SUCCESS;
+
+    char *skey = cluster_open_session_key(c, key, strlen(key), &skeylen, &slot);
+
+    while (1) {
+        // TODO: add lock acquire loop timeout
+
+        cmdlen = redis_cmd_format_static(&cmd, "GETSET", "s", skey, skeylen, "1", 1);
+
+        if (c != NULL) {
+            if (cluster_send_command(c, slot, cmd, cmdlen TSRMLS_CC) < 0 || c->err) {
+                retcode = FAILURE;
+                break;
+            }
+
+            c_reply = cluster_read_resp(c TSRMLS_CC);
+            if (!c_reply || c->err) {
+                if (c_reply) {
+                    cluster_free_reply(c_reply, 1);
+                }
+                retcode = FAILURE;
+                break;
+            }
+
+            if (c_reply->len == 0) {
+                // No previous session lock
+                break;
+            }
+        }
+        else if (sck != NULL) {
+            if (redis_sock_write(sck, cmd, cmdlen TSRMLS_CC) < 0) {
+                retcode = FAILURE;
+                break;
+            }
+
+            if ((sck_reply = redis_sock_read(sck, &sck_reply_len TSRMLS_CC)) == NULL) {
+                retcode = FAILURE;
+                break;
+            }
+
+            if (sck_reply == NULL) {
+                // No previous session lock
+                break;
+            }
+        }
+        else {
+            retcode = FAILURE;
+        }
+    }
+
+    if (retcode != -1) {
+        // Lock was acquired. Set expiration timer on it.
+        cmdlen = redis_cmd_format_static(&cmd, "EXPIRE", "s", skey, skeylen, LOCK_TIMEOUT_SECONDS);
+        if (cluster_send_command(c, slot, cmd, cmdlen TSRMLS_CC) < 0 || c->err) {
+            // TODO: log error that lock could not expire
+            release_open_session_lock(c, sck, key);
+            retcode = FAILURE;
+        }
+    }
+
+    efree(cmd);
+    efree(skey);
+
+    // TODO: set last error message on failure
+
+    return retcode;
+}
+
+int release_open_session_lock(redisCluster *c, RedisSock *sck, char *key) {
+    clusterReply *c_reply;
+    int sck_reply_len;
+    char *sck_reply;
+
+    char *cmd, *skey;
+    int cmdlen, skeylen;
+    short slot;
+    int retcode = SUCCESS;
+
+    skey = cluster_open_session_key(c, key, strlen(key), &skeylen, &slot);
+    cmdlen = redis_cmd_format_static(&cmd, "DEL", "s", skey, skeylen);
+    efree(skey);
+
+    if (c != NULL) {
+        if (cluster_send_command(c, slot, cmd, cmdlen TSRMLS_CC) < 0 || c->err) {
+            retcode = FAILURE;
+            goto cleanup;
+        }
+
+        c_reply = cluster_read_resp(c TSRMLS_CC);
+        if (!c_reply || c->err) {
+            if (c_reply) {
+                cluster_free_reply(c_reply, 1);
+            }
+            retcode = FAILURE;
+            goto cleanup;
+        }
+    }
+    else if (sck != NULL) {
+        if (redis_sock_write(sck, cmd, cmdlen TSRMLS_CC) < 0) {
+            retcode = FAILURE;
+            goto cleanup;
+        }
+
+        if ((sck_reply = redis_sock_read(sck, &sck_reply_len TSRMLS_CC)) == NULL) {
+            retcode = FAILURE;
+            goto cleanup;
+        }
+    }
+    else {
+        retcode = FAILURE;
+    }
+
+cleanup:
+    efree(cmd);
+
+    return retcode;
+}
+
 /* {{{ PS_READ_FUNC
  */
 PS_READ_FUNC(rediscluster) {
-    redisCluster *c = PS_GET_MOD_DATA();
+    redis_ps_mod_data *data = PS_GET_MOD_DATA();
+    redisCluster *c = data->c;
     clusterReply *reply;
     char *cmd, *skey;
     int cmdlen, skeylen;
     short slot;
+
+    if (data->session_key == NULL) {
+        if (acquire_open_session_lock(c, NULL, data->session_key) == FAILURE) {
+            return FAILURE;
+        }
+    }
 
     /* Set up our command and slot information */
     skey = cluster_session_key(c, key, strlen(key), &skeylen, &slot);
@@ -646,7 +834,8 @@ PS_READ_FUNC(rediscluster) {
 /* {{{ PS_WRITE_FUNC
  */
 PS_WRITE_FUNC(rediscluster) {
-    redisCluster *c = PS_GET_MOD_DATA();
+    redis_ps_mod_data *data = PS_GET_MOD_DATA();
+    redisCluster *c = data->c;
     clusterReply *reply;
     char *cmd, *skey;
     int cmdlen, skeylen;
@@ -685,7 +874,8 @@ PS_WRITE_FUNC(rediscluster) {
 /* {{{ PS_DESTROY_FUNC(rediscluster)
  */
 PS_DESTROY_FUNC(rediscluster) {
-    redisCluster *c = PS_GET_MOD_DATA();
+    redis_ps_mod_data *data = PS_GET_MOD_DATA();
+    redisCluster *c = data->c;
     clusterReply *reply;
     char *cmd, *skey;
     int cmdlen, skeylen;
@@ -722,8 +912,13 @@ PS_DESTROY_FUNC(rediscluster) {
  */
 PS_CLOSE_FUNC(rediscluster)
 {
-    redisCluster *c = PS_GET_MOD_DATA();
+    redis_ps_mod_data *data = PS_GET_MOD_DATA();
+    redisCluster *c = data->c;
     if (c) {
+        if (data->session_key != NULL) {
+            release_open_session_lock(c, NULL, data->session_key);
+        }
+
         cluster_free(c);
         PS_SET_MOD_DATA(NULL);
     }
