@@ -712,7 +712,7 @@ int acquire_open_session_lock(redisCluster *c, RedisSock *sck, char *key) {
         }
     }
 
-    if (retcode != -1) {
+    if (retcode != FAILURE) {
         // Lock was acquired. Set expiration timer on it.
         cmdlen = redis_cmd_format_static(&cmd, "EXPIRE", "s", skey, skeylen, LOCK_TIMEOUT_SECONDS);
         if (cluster_send_command(c, slot, cmd, cmdlen TSRMLS_CC) < 0 || c->err) {
